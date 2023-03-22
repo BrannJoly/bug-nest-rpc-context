@@ -1,73 +1,137 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="200" alt="Nest Logo" /></a>
-</p>
+This app starts a nest microservice with a custom transport strategy, and demonstrates a bug :
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+There are two handlers in app.controller.ts.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://coveralls.io/github/nestjs/nest?branch=master" target="_blank"><img src="https://coveralls.io/repos/github/nestjs/nest/badge.svg?branch=master#9" alt="Coverage" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+The first one receives the test message without problem.
 
-## Description
+The second handler received undefined instead.
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+The only difference between those twœ arguments is that the second one has an injected argument (@Ctx())
+
+I tracked down the issue to rpc-context-creator (https://github.com/nestjs/nest/blob/master/packages/microservices/context/rpc-context-creator.ts)
+
+When I debug, args contains the actual message, so if fnApplyPipes is falsy, everything works ok.
+if fnApplyPipes is defined, it maps the injected arguments to initialArgs but completely ignores the "normal" arguments :
+
+I'm not sure whether the bug lies in getParamsMetadata(), mergeParamsMetatypes(), createPipesFn(), or whether we should overwrite undefined args just before calling the handler ?
+
+```typescript
+ create(instance, callback, moduleKey, methodName, contextId = constants_3.STATIC_CONTEXT, inquirerId, defaultCallMetadata = rpc_metadata_constants_1.DEFAULT_CALLBACK_METADATA) {
+        const contextType = 'rpc';
+        const { argsLength, paramtypes, getParamsMetadata } = this.getMetadata(instance, methodName, defaultCallMetadata, contextType);
+        const exceptionHandler = this.exceptionFiltersContext.create(instance, callback, moduleKey, contextId, inquirerId);
+        const pipes = this.pipesContextCreator.create(instance, callback, moduleKey, contextId, inquirerId);
+        const guards = this.guardsContextCreator.create(instance, callback, moduleKey, contextId, inquirerId);
+        const interceptors = this.interceptorsContextCreator.create(instance, callback, moduleKey, contextId, inquirerId);
+        const paramsMetadata = getParamsMetadata(moduleKey);
+
+        // paramsMetadata = [
+        //   {
+        //     index: 1,
+        //     extractValue: (...args) => paramsFactory.exchangeKeyForValue(numericType, data, args),
+        //     type: 6,
+        //     data: undefined,
+        //     pipes: [
+        //     ],
+        //   },
+        // ]
+        const paramsOptions = paramsMetadata /
+            ? this.contextUtils.mergeParamsMetatypes(paramsMetadata, paramtypes)
+            : [];
+
+        // paramsOptions= [
+        //   {
+        //     index: 1,
+        //     extractValue: (...args) => paramsFactory.exchangeKeyForValue(numericType, data, args),
+        //     type: 6,
+        //     data: undefined,
+        //     pipes: [
+        //     ],
+        //     metatype: class AmqpContext extends microservices_1.BaseRpcContext {
+        //       constructor(args) {
+        //           super(args);
+        //       }
+        //     },
+        //   },
+        // ]
+
+
+        const fnApplyPipes = this.createPipesFn(pipes, paramsOptions);
+        const fnCanActivate = this.createGuardsFn(guards, instance, callback, contextType);
+        const handler = (initialArgs, args) => async () => {
+          // initialArgs = [  undefined,  undefined]
+          // args = [
+          // { test: "test",},
+          // { args: {  pattern: "test2", },  },
+          //]
+            if (fnApplyPipes) {
+                await fnApplyPipes(initialArgs, ...args);
+                return callback.apply(instance, initialArgs);
+            }
+            return callback.apply(instance, args);
+        };
+```
+
+```typescript
+    mergeParamsMetatypes(paramsProperties, paramtypes) {
+        if (!paramtypes) {
+            return paramsProperties;
+        }
+        return paramsProperties.map(param => (Object.assign(Object.assign({}, param), { metatype: paramtypes[param.index] })));
+    }
+```
+
+```typescript
+ public createPipesFn(
+    pipes: PipeTransform[],
+    paramsOptions: (ParamProperties & { metatype?: unknown })[],
+
+// paramsOptions = [
+//   {
+//     index: 1,
+//     extractValue: (...args) => paramsFactory.exchangeKeyForValue(numericType, data, args),
+//     type: 6,
+//     data: undefined,
+//     pipes: [
+//     ],
+//     metatype: class AmqpContext extends microservices_1.BaseRpcContext {
+//       constructor(args) {
+//           super(args);
+//       }
+//     },
+//   },
+// ]
+
+  ) {
+    const pipesFn = async (args: unknown[], ...params: unknown[]) => {
+      const resolveParamValue = async (
+        param: ParamProperties & { metatype?: unknown },
+      ) => {
+        const {
+          index,
+          extractValue,
+          type,
+          data,
+          metatype,
+          pipes: paramPipes,
+        } = param;
+        const value = extractValue(...params);
+
+        args[index] = await this.getParamValue(
+          value,
+          { metatype, type, data },
+          pipes.concat(paramPipes),
+        );
+      };
+      await Promise.all(paramsOptions.map(resolveParamValue));
+    };
+    return paramsOptions.length ? pipesFn : null;
+  }
+```
 
 ## Installation
 
 ```bash
 $ npm install
-```
-
-## Running the app
-
-```bash
-# development
-$ npm run start
-
-# watch mode
 $ npm run start:dev
-
-# production mode
-$ npm run start:prod
 ```
-
-## Test
-
-```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
-```
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://kamilmysliwiec.com)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](LICENSE).
